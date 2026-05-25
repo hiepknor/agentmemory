@@ -1254,6 +1254,126 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/extract", http_method: "POST" },
   });
 
+  sdk.registerFunction("api::graph-build",
+    async (
+      req: ApiRequest<{
+        project?: unknown;
+        sessionId?: unknown;
+        limit?: unknown;
+        batchSize?: unknown;
+      }>,
+    ): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+
+      const body = req.body || {};
+      const project = asNonEmptyString(body.project);
+      const sessionId = asNonEmptyString(body.sessionId);
+      if (body.project !== undefined && !project) {
+        return { status_code: 400, body: { error: "project must be a non-empty string" } };
+      }
+      if (body.sessionId !== undefined && !sessionId) {
+        return { status_code: 400, body: { error: "sessionId must be a non-empty string" } };
+      }
+
+      const parsedLimit = parseOptionalPositiveInt(body.limit);
+      const parsedBatchSize = parseOptionalPositiveInt(body.batchSize);
+      if (parsedLimit === null) {
+        return { status_code: 400, body: { error: "limit must be a positive integer" } };
+      }
+      if (parsedBatchSize === null) {
+        return { status_code: 400, body: { error: "batchSize must be a positive integer" } };
+      }
+
+      const limit = Math.min(parsedLimit ?? 200, 1000);
+      const batchSize = Math.min(parsedBatchSize ?? 50, 100);
+
+      try {
+        let sessions = await kv.list<Session>(KV.sessions);
+        if (sessionId) {
+          sessions = sessions.filter((s) => s.id === sessionId);
+        }
+        if (project) {
+          sessions = sessions.filter((s) => s.project === project);
+        }
+
+        const observationsBySession = await Promise.all(
+          sessions.map((s) =>
+            kv
+              .list<CompressedObservation>(KV.observations(s.id))
+              .catch(() => [] as CompressedObservation[]),
+          ),
+        );
+
+        const observations = observationsBySession
+          .flat()
+          .filter((o) => typeof o.title === "string" && o.title.trim())
+          .sort(
+            (a, b) =>
+              new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+          )
+          .slice(0, limit);
+
+        if (observations.length === 0) {
+          return {
+            status_code: 200,
+            body: {
+              success: true,
+              sessionsScanned: sessions.length,
+              observationsScanned: 0,
+              batches: 0,
+              nodes: 0,
+              edges: 0,
+              nodesAdded: 0,
+              edgesAdded: 0,
+            },
+          };
+        }
+
+        let nodesAdded = 0;
+        let edgesAdded = 0;
+        let batches = 0;
+        const errors: string[] = [];
+        for (let i = 0; i < observations.length; i += batchSize) {
+          const batch = observations.slice(i, i + batchSize);
+          const result = await sdk.trigger({
+            function_id: "mem::graph-extract",
+            payload: { observations: batch },
+          }) as { success?: boolean; nodesAdded?: number; edgesAdded?: number; error?: string };
+          batches++;
+          if (result.success) {
+            nodesAdded += result.nodesAdded ?? 0;
+            edgesAdded += result.edgesAdded ?? 0;
+          } else {
+            errors.push(result.error || "graph extraction failed");
+          }
+        }
+
+        return {
+          status_code: errors.length > 0 ? 207 : 200,
+          body: {
+            success: errors.length === 0,
+            sessionsScanned: sessions.length,
+            observationsScanned: observations.length,
+            batches,
+            nodes: nodesAdded,
+            edges: edgesAdded,
+            nodesAdded,
+            edgesAdded,
+            errors,
+          },
+        };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-build",
+    config: { api_path: "/agentmemory/graph/build", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::consolidate-pipeline", 
     async (req: ApiRequest<{ tier?: string }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
